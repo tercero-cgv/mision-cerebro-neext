@@ -1,0 +1,921 @@
+// ============================================================
+//  MISIÓN CEREBRO — Lógica principal
+//  Firebase Realtime Database + Anthropic API
+// ============================================================
+
+// ── State ──────────────────────────────────────────────────
+let currentUser   = null;   // { type: 'student'|'teacher', name, key }
+let currentDay    = null;   // day object being played
+let gameState     = {};     // active game state
+let dbListeners   = [];     // Firebase listener refs to detach on logout
+
+// ── DOM helpers ────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const showScreen = id => {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  $(id).classList.add('active');
+  window.scrollTo(0, 0);
+};
+
+// ── Toast ──────────────────────────────────────────────────
+function toast(msg, type = 'info', duration = 3000) {
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), duration);
+}
+
+// ── Emoji avatars ─────────────────────────────────────────
+const AVATARS = ['🚀','⚡','🎯','🦊','🐉','🌟','🔥','💎','🎮','🧩','🦁','🐯','🦄','🤖','👾'];
+function randomAvatar() { return AVATARS[Math.floor(Math.random() * AVATARS.length)]; }
+
+// ── Game type config ───────────────────────────────────────
+const GAME_TYPES = {
+  escape:   { icon: '🔐', label: 'ESCAPE ROOM IA', badge: 'badge-escape',   xp: 150 },
+  math:     { icon: '🔢', label: 'DESAFÍO MATE',   badge: 'badge-math',     xp: 100 },
+  words:    { icon: '⚔️', label: 'BATALLA PALABRAS',badge: 'badge-words',   xp: 100 },
+  logic:    { icon: '🧩', label: 'ACERTIJOS',       badge: 'badge-logic',   xp: 100 },
+  treasure: { icon: '🗺️', label: 'TESORO',          badge: 'badge-treasure',xp: 120 },
+  lightning:{ icon: '⚡', label: 'RELÁMPAGO',       badge: 'badge-lightning',xp: 80  },
+};
+
+// ── Trophy definitions ─────────────────────────────────────
+const TROPHIES = [
+  { id: 'first',   emoji: '🥇', label: '1er desafío', condition: s => s.completed >= 1 },
+  { id: 'three',   emoji: '🏆', label: 'Triple',       condition: s => s.completed >= 3 },
+  { id: 'escape',  emoji: '🔐', label: 'Escapista',    condition: s => (s.byType?.escape || 0) >= 1 },
+  { id: 'math',    emoji: '🔢', label: 'Matemático',   condition: s => (s.byType?.math   || 0) >= 1 },
+  { id: 'words',   emoji: '⚔️', label: 'Lingüista',   condition: s => (s.byType?.words  || 0) >= 1 },
+  { id: 'xp500',   emoji: '💎', label: '500 XP',       condition: s => (s.xp || 0) >= 500 },
+  { id: 'xp1000',  emoji: '👑', label: '1000 XP',      condition: s => (s.xp || 0) >= 1000 },
+  { id: 'perfect', emoji: '⭐', label: 'Perfecto',      condition: s => (s.perfectGames || 0) >= 1 },
+];
+
+// ══════════════════════════════════════════════════════════
+//  AUTH
+// ══════════════════════════════════════════════════════════
+
+async function loginTeacher() {
+  const pass = $('teacher-pass').value.trim();
+  $('teacher-error').textContent = '';
+  if (!pass) return ($('teacher-error').textContent = 'Ingresa tu contraseña.');
+
+  try {
+    const snap = await db.ref('config/teacherPass').once('value');
+    let stored = snap.val();
+    if (!stored) {
+      // First time: set the password
+      await db.ref('config/teacherPass').set(pass);
+      stored = pass;
+    }
+    if (pass !== stored) return ($('teacher-error').textContent = 'Contraseña incorrecta.');
+
+    currentUser = { type: 'teacher' };
+    showScreen('screen-teacher');
+    loadTeacherData();
+  } catch(e) {
+    $('teacher-error').textContent = 'Error de conexión. Verifica tu configuración de Firebase.';
+  }
+}
+
+async function loginStudent() {
+  const name = $('student-name').value.trim();
+  const pass = $('student-pass').value.trim();
+  $('student-error').textContent = '';
+  if (!name) return ($('student-error').textContent = 'Escribe tu nombre.');
+  if (!pass) return ($('student-error').textContent = 'Escribe tu contraseña.');
+
+  try {
+    const snap = await db.ref('students').orderByChild('name').equalTo(name).once('value');
+    const data = snap.val();
+    if (!data) return ($('student-error').textContent = 'Nombre no encontrado. Pide a tu maestro que te registre.');
+
+    const key = Object.keys(data)[0];
+    const student = data[key];
+    if (student.pass !== pass) return ($('student-error').textContent = 'Contraseña incorrecta.');
+
+    currentUser = { type: 'student', name, key };
+    $('student-display-name').textContent = name.toUpperCase();
+    showScreen('screen-student');
+    loadStudentPanel();
+  } catch(e) {
+    $('student-error').textContent = 'Error de conexión.';
+  }
+}
+
+function logout() {
+  // Detach Firebase listeners
+  dbListeners.forEach(({ ref, event, fn }) => ref.off(event, fn));
+  dbListeners = [];
+  currentUser = null;
+  currentDay = null;
+  gameState = {};
+  // Clear inputs
+  ['student-name','student-pass','teacher-pass'].forEach(id => { try { $(id).value = ''; } catch(_){} });
+  showScreen('screen-lobby');
+}
+
+// ══════════════════════════════════════════════════════════
+//  TEACHER PANEL
+// ══════════════════════════════════════════════════════════
+
+function loadTeacherData() {
+  loadStudentsTab();
+  loadDaysTab();
+  loadProgressTab();
+}
+
+// ── Students tab ────────────────────────────────────────────
+function loadStudentsTab() {
+  const ref = db.ref('students');
+  const fn = snap => {
+    const data = snap.val() || {};
+    const list = $('students-list');
+    if (!Object.keys(data).length) {
+      list.innerHTML = `<div class="empty-state"><div class="empty-icon">👥</div>Sin agentes registrados aún</div>`;
+      return;
+    }
+    list.innerHTML = '';
+    Object.entries(data).forEach(([key, s]) => {
+      const div = document.createElement('div');
+      div.className = 'student-card';
+      div.innerHTML = `
+        <div class="student-avatar">${s.avatar || '🎒'}</div>
+        <div class="student-name">${s.name}</div>
+        <div class="student-xp">⭐ ${s.xp || 0} XP · ${s.completed || 0} misiones</div>
+        <div class="student-actions">
+          <button class="action-btn edit" onclick="resetStudentProgress('${key}','${s.name}')">↺ Reset</button>
+          <button class="action-btn" onclick="deleteStudent('${key}','${s.name}')">✕ Eliminar</button>
+        </div>`;
+      list.appendChild(div);
+    });
+  };
+  ref.on('value', fn);
+  dbListeners.push({ ref, event: 'value', fn });
+}
+
+function openAddStudent() { $('modal-add-student').classList.remove('hidden'); $('new-student-name').focus(); }
+
+async function addStudent() {
+  const name = $('new-student-name').value.trim();
+  const pass = $('new-student-pass').value.trim();
+  $('add-student-error').textContent = '';
+  if (!name || !pass) return ($('add-student-error').textContent = 'Llena todos los campos.');
+
+  // Check duplicate
+  const snap = await db.ref('students').orderByChild('name').equalTo(name).once('value');
+  if (snap.val()) return ($('add-student-error').textContent = 'Ese nombre ya existe.');
+
+  await db.ref('students').push({ name, pass, avatar: randomAvatar(), xp: 0, completed: 0, byType: {}, trophies: {}, completedDays: {} });
+  $('new-student-name').value = '';
+  $('new-student-pass').value = '';
+  closeModal('modal-add-student');
+  toast(`Agente ${name} registrado ✓`, 'success');
+}
+
+async function deleteStudent(key, name) {
+  if (!confirm(`¿Eliminar a ${name}? Se borrarán todos sus datos.`)) return;
+  await db.ref(`students/${key}`).remove();
+  toast(`${name} eliminado`, 'error');
+}
+
+async function resetStudentProgress(key, name) {
+  if (!confirm(`¿Reiniciar el progreso de ${name}?`)) return;
+  await db.ref(`students/${key}`).update({ xp: 0, completed: 0, byType: {}, trophies: {}, completedDays: {} });
+  toast(`Progreso de ${name} reiniciado`, 'info');
+}
+
+// ── Days tab ────────────────────────────────────────────────
+function loadDaysTab() {
+  const ref = db.ref('days');
+  const fn = snap => {
+    const data = snap.val() || {};
+    const list = $('days-list');
+    if (!Object.keys(data).length) {
+      list.innerHTML = `<div class="empty-state"><div class="empty-icon">📅</div>Sin desafíos creados aún</div>`;
+      return;
+    }
+    list.innerHTML = '';
+    Object.entries(data).forEach(([key, d]) => {
+      const gt = GAME_TYPES[d.type] || GAME_TYPES.escape;
+      const div = document.createElement('div');
+      div.className = `day-card ${d.unlocked ? 'unlocked' : ''}`;
+      div.innerHTML = `
+        <div class="day-header">
+          <span class="day-emoji">${gt.icon}</span>
+          <span class="day-name">${d.title}</span>
+        </div>
+        <div class="day-topic">Tema: ${d.topic || 'General'}</div>
+        <label class="toggle-wrap">
+          <label class="toggle">
+            <input type="checkbox" ${d.unlocked ? 'checked' : ''} onchange="toggleDay('${key}', this.checked)">
+            <span class="toggle-track"></span>
+          </label>
+          <span class="toggle-label">${d.unlocked ? '🟢 Activo' : '🔴 Bloqueado'}</span>
+        </label>
+        <button class="day-delete" onclick="deleteDay('${key}','${d.title}')">✕ Eliminar</button>`;
+      list.appendChild(div);
+    });
+  };
+  ref.on('value', fn);
+  dbListeners.push({ ref, event: 'value', fn });
+}
+
+function openAddDay() { $('modal-add-day').classList.remove('hidden'); $('new-day-title').focus(); }
+
+async function addDay() {
+  const title = $('new-day-title').value.trim();
+  const type  = $('new-day-type').value;
+  const topic = $('new-day-topic').value.trim();
+  $('add-day-error').textContent = '';
+  if (!title) return ($('add-day-error').textContent = 'Escribe un título.');
+
+  await db.ref('days').push({ title, type, topic: topic || 'General', unlocked: false, createdAt: Date.now() });
+  $('new-day-title').value = '';
+  $('new-day-topic').value = '';
+  closeModal('modal-add-day');
+  toast(`Desafío "${title}" creado ✓`, 'success');
+}
+
+async function toggleDay(key, unlocked) {
+  await db.ref(`days/${key}`).update({ unlocked });
+  toast(unlocked ? '🟢 Desafío activado' : '🔴 Desafío bloqueado', unlocked ? 'success' : 'info');
+}
+
+async function deleteDay(key, title) {
+  if (!confirm(`¿Eliminar "${title}"?`)) return;
+  await db.ref(`days/${key}`).remove();
+  toast(`"${title}" eliminado`, 'error');
+}
+
+// ── Progress tab ────────────────────────────────────────────
+function loadProgressTab() {
+  const ref = db.ref('students');
+  const fn = snap => {
+    const data = snap.val() || {};
+    const list = $('progress-list');
+    if (!Object.keys(data).length) {
+      list.innerHTML = `<div class="empty-state"><div class="empty-icon">📊</div>Sin agentes aún</div>`;
+      return;
+    }
+    // Sort by XP desc
+    const sorted = Object.entries(data).sort(([,a],[,b]) => (b.xp||0) - (a.xp||0));
+    list.innerHTML = '';
+    sorted.forEach(([, s], i) => {
+      const trophyList = Object.keys(s.trophies || {}).map(id => {
+        const t = TROPHIES.find(x => x.id === id);
+        return t ? t.emoji : '';
+      }).join('');
+      const maxXP = Math.max(...sorted.map(([,x]) => x.xp || 0), 1);
+      const pct = Math.round(((s.xp || 0) / maxXP) * 100);
+      const div = document.createElement('div');
+      div.className = 'progress-row';
+      div.innerHTML = `
+        <div class="prog-avatar">${i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : s.avatar || '🎒'}</div>
+        <div class="prog-info">
+          <div class="prog-name">${s.name} <span style="color:var(--text-muted);font-size:11px">· ${s.completed||0} misiones</span></div>
+          <div class="prog-bar-track"><div class="prog-bar-fill" style="width:${pct}%"></div></div>
+        </div>
+        <div class="prog-xp">⭐ ${s.xp || 0} XP</div>
+        <div class="prog-trophies">${trophyList || '—'}</div>`;
+      list.appendChild(div);
+    });
+  };
+  ref.on('value', fn);
+  dbListeners.push({ ref, event: 'value', fn });
+}
+
+// ── Settings ────────────────────────────────────────────────
+async function changeTeacherPass() {
+  const p = $('new-teacher-pass').value.trim();
+  $('settings-msg').textContent = '';
+  if (!p || p.length < 4) return ($('settings-msg').textContent = 'Mínimo 4 caracteres.', $('settings-msg').style.color = 'var(--red)');
+  await db.ref('config/teacherPass').set(p);
+  $('new-teacher-pass').value = '';
+  $('settings-msg').textContent = '✓ Contraseña actualizada';
+  $('settings-msg').style.color = 'var(--green)';
+}
+
+// ── Tab switching ───────────────────────────────────────────
+function switchTab(name, btn) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => { t.classList.add('hidden'); t.classList.remove('active'); });
+  btn.classList.add('active');
+  $(`tab-${name}`).classList.remove('hidden');
+  $(`tab-${name}`).classList.add('active');
+}
+
+// ══════════════════════════════════════════════════════════
+//  STUDENT PANEL
+// ══════════════════════════════════════════════════════════
+
+function loadStudentPanel() {
+  const sRef = db.ref(`students/${currentUser.key}`);
+  const dRef = db.ref('days');
+
+  const sFn = snap => {
+    const s = snap.val();
+    if (!s) return logout();
+    // XP
+    $('student-xp').textContent = s.xp || 0;
+    // Progress bar
+    const totalDays = parseInt($('activities-list').dataset.total || 0) || 1;
+    const pct = Math.round(((s.completed || 0) / totalDays) * 100);
+    $('student-progress-bar').style.width = Math.min(pct, 100) + '%';
+    $('student-progress-label').textContent = `${s.completed || 0} misiones completadas`;
+    // Trophies
+    checkAndAwardTrophies(s);
+    renderTrophies(s);
+  };
+
+  const dFn = snap => {
+    const days = snap.val() || {};
+    const sSnap = db.ref(`students/${currentUser.key}`).once('value').then(ss => {
+      const s = ss.val() || {};
+      renderActivities(days, s);
+      $('activities-list').dataset.total = Object.keys(days).length;
+    });
+  };
+
+  sRef.on('value', sFn);
+  dRef.on('value', dFn);
+  dbListeners.push({ ref: sRef, event: 'value', fn: sFn });
+  dbListeners.push({ ref: dRef, event: 'value', fn: dFn });
+}
+
+function renderActivities(days, student) {
+  const list = $('activities-list');
+  const entries = Object.entries(days).sort(([,a],[,b]) => (a.createdAt||0)-(b.createdAt||0));
+  if (!entries.length) {
+    list.innerHTML = `<div class="empty-state"><div class="empty-icon">📅</div>Tu maestro aún no ha creado desafíos.<br>¡Vuelve pronto!</div>`;
+    return;
+  }
+  list.innerHTML = '';
+  entries.forEach(([key, d]) => {
+    const gt = GAME_TYPES[d.type] || GAME_TYPES.escape;
+    const completed = (student.completedDays || {})[key];
+    const card = document.createElement('div');
+    card.className = `activity-card ${!d.unlocked ? 'locked' : ''} ${completed ? 'completed' : ''}`;
+    card.innerHTML = `
+      <span class="act-status">${!d.unlocked ? '🔒' : completed ? '✅' : '▶'}</span>
+      <div class="act-icon">${gt.icon}</div>
+      <div class="act-title">${d.title}</div>
+      <div class="act-topic">Tema: ${d.topic || 'General'}</div>
+      <span class="act-type-badge ${gt.badge}">${gt.label}</span>
+      <div class="act-xp">${completed ? '✓ COMPLETADO' : `+${gt.xp} XP posibles`}</div>`;
+    if (d.unlocked && !completed) {
+      card.onclick = () => startGame(key, d);
+    }
+    list.appendChild(card);
+  });
+}
+
+function renderTrophies(student) {
+  const row = $('trophy-row');
+  const earned = student.trophies || {};
+  const items = TROPHIES.filter(t => earned[t.id]);
+  if (!items.length) { row.innerHTML = ''; return; }
+  row.innerHTML = items.map(t =>
+    `<div class="trophy" data-label="${t.label}" title="${t.label}">${t.emoji}</div>`
+  ).join('');
+}
+
+async function checkAndAwardTrophies(student) {
+  const earned = student.trophies || {};
+  const updates = {};
+  TROPHIES.forEach(t => {
+    if (!earned[t.id] && t.condition(student)) {
+      updates[`trophies/${t.id}`] = true;
+    }
+  });
+  if (Object.keys(updates).length) {
+    await db.ref(`students/${currentUser.key}`).update(updates);
+    const names = Object.keys(updates).map(k => TROPHIES.find(t => t.id === k.split('/')[1])?.emoji).join(' ');
+    toast(`🏆 ¡Nuevo trofeo! ${names}`, 'success', 4000);
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  GAMES ENGINE
+// ══════════════════════════════════════════════════════════
+
+function startGame(key, day) {
+  currentDay = { key, ...day };
+  const gt = GAME_TYPES[day.type] || GAME_TYPES.escape;
+  $('game-icon').textContent = gt.icon;
+  $('game-title').textContent = day.title;
+  $('game-type-label').textContent = `${gt.label} · Tema: ${day.topic || 'General'}`;
+  $('game-xp-possible').textContent = `+${gt.xp} XP posibles`;
+  showScreen('screen-game');
+
+  switch (day.type) {
+    case 'escape':    startEscapeRoom(day);    break;
+    case 'math':      startMathChallenge(day); break;
+    case 'words':     startWordsBattle(day);   break;
+    case 'logic':     startLogicPuzzle(day);   break;
+    case 'treasure':  startTreasureMap(day);   break;
+    case 'lightning': startLightning(day);     break;
+    default:          startMathChallenge(day);
+  }
+}
+
+function exitGame() {
+  currentDay = null;
+  gameState = {};
+  showScreen('screen-student');
+}
+
+// ── Award XP after game ─────────────────────────────────────
+async function awardXP(xp, perfect = false) {
+  const key = currentUser.key;
+  const snap = await db.ref(`students/${key}`).once('value');
+  const s = snap.val() || {};
+  const dayKey = currentDay.key;
+  const type = currentDay.type;
+
+  const updates = {
+    xp: (s.xp || 0) + xp,
+    completed: (s.completed || 0) + 1,
+    [`completedDays/${dayKey}`]: true,
+    [`byType/${type}`]: ((s.byType || {})[type] || 0) + 1,
+  };
+  if (perfect) updates.perfectGames = (s.perfectGames || 0) + 1;
+
+  await db.ref(`students/${key}`).update(updates);
+}
+
+// ── Show complete screen ────────────────────────────────────
+function showComplete(xp, msg, perfect = false) {
+  $('game-area').innerHTML = `
+    <div class="game-complete">
+      <div class="complete-icon">${perfect ? '🌟' : '✅'}</div>
+      <div class="complete-title">${perfect ? '¡PERFECTO!' : '¡MISIÓN CUMPLIDA!'}</div>
+      <div class="complete-xp">+${xp} XP ganados</div>
+      <div class="complete-msg">${msg}</div>
+      <button class="neon-btn btn-green" style="width:auto;margin-top:10px" onclick="exitGame()">
+        ← VOLVER AL HUB
+      </button>
+    </div>`;
+  awardXP(xp, perfect);
+}
+
+// ══════════════════════════════════════════════════════════
+//  GAME: ESCAPE ROOM (AI)
+// ══════════════════════════════════════════════════════════
+
+async function startEscapeRoom(day) {
+  $('game-area').innerHTML = `
+    <div class="ai-loading">
+      <div class="ai-spinner"></div>
+      <div class="ai-loading-text">GENERANDO ESCAPE ROOM · IA EN ACCIÓN...</div>
+    </div>`;
+
+  try {
+    const prompt = `Eres un diseñador de Escape Rooms educativos para estudiantes de 5to grado (10-11 años) en Puerto Rico.
+Crea un escape room con exactamente 3 acertijos educativos sobre el tema: "${day.topic}".
+Materia: puede ser Español o Matemáticas según el tema.
+
+Devuelve SOLO un JSON válido con esta estructura exacta (sin markdown, sin explicación):
+{
+  "intro": "Narrativa de 2-3 oraciones que introduce el escape room de forma emocionante",
+  "puzzles": [
+    {
+      "clue": "Descripción del acertijo o pista (2-4 oraciones)",
+      "question": "La pregunta clara y específica",
+      "answer": "respuesta exacta en minúsculas",
+      "hint": "Una pista si el estudiante se equivoca"
+    }
+  ]
+}
+Los acertijos deben ser desafiantes pero alcanzables para 5to grado. Mezcla creatividad con educación.`;
+
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    const data = await res.json();
+    const text = data.content[0].text.trim().replace(/```json|```/g, '');
+    const escape = JSON.parse(text);
+    renderEscapeRoom(escape);
+  } catch (e) {
+    // Fallback escape room
+    renderEscapeRoom(getFallbackEscape(day.topic));
+  }
+}
+
+function renderEscapeRoom(escape) {
+  gameState = { puzzles: escape.puzzles, current: 0, errors: 0, score: 0 };
+
+  const showPuzzle = (idx) => {
+    const p = escape.puzzles[idx];
+    const total = escape.puzzles.length;
+    $('game-area').innerHTML = `
+      <div class="game-progress-row">
+        <span class="game-step">CERRADURA ${idx + 1} DE ${total}</span>
+        <span class="game-score">🔓 ${gameState.score}/${total}</span>
+      </div>
+      <div class="escape-clue">${idx === 0 && escape.intro ? `<em style="color:var(--purple);display:block;margin-bottom:12px">${escape.intro}</em>` : ''}<strong>PISTA:</strong> ${p.clue}</div>
+      <div class="game-question">${p.question}</div>
+      <div class="game-input-row">
+        <input type="text" class="neon-input" id="escape-answer" placeholder="Tu respuesta..." autocomplete="off" />
+        <button class="neon-btn btn-purple" style="width:auto;padding:12px 20px" onclick="checkEscapeAnswer(${idx})">ENVIAR</button>
+      </div>
+      <div class="game-feedback" id="escape-feedback"></div>`;
+
+    $('escape-answer').addEventListener('keydown', e => {
+      if (e.key === 'Enter') checkEscapeAnswer(idx);
+    });
+    setTimeout(() => $('escape-answer').focus(), 100);
+  };
+
+  window.checkEscapeAnswer = (idx) => {
+    const p = escape.puzzles[idx];
+    const ans = $('escape-answer').value.trim().toLowerCase();
+    const fb = $('escape-feedback');
+
+    if (!ans) return;
+
+    // Flexible answer checking
+    const correct = ans === p.answer ||
+      p.answer.includes(ans) ||
+      ans.includes(p.answer.replace(/[^a-záéíóúñ0-9]/gi, '').toLowerCase());
+
+    if (correct) {
+      gameState.score++;
+      fb.textContent = '🔓 ¡CERRADURA ABIERTA!';
+      fb.className = 'game-feedback feedback-correct';
+      setTimeout(() => {
+        if (idx + 1 < escape.puzzles.length) showPuzzle(idx + 1);
+        else {
+          const perfect = gameState.errors === 0;
+          const xp = perfect ? 150 : 100;
+          showComplete(xp, `Abriste las ${escape.puzzles.length} cerraduras${perfect ? ' sin errores' : ''}. ¡Eres un maestro del escape room!`, perfect);
+        }
+      }, 1200);
+    } else {
+      gameState.errors++;
+      fb.textContent = `💡 Pista: ${p.hint}`;
+      fb.className = 'game-feedback feedback-wrong';
+    }
+  };
+
+  showPuzzle(0);
+}
+
+function getFallbackEscape(topic) {
+  return {
+    intro: `¡Atención, agente! El villano Señor Confusión ha bloqueado el laboratorio con 3 cerraduras matemáticas sobre ${topic}. ¡Debes resolverlas todas para escapar!`,
+    puzzles: [
+      { clue: 'La primera cerradura tiene un código numérico.', question: `¿Cuánto es 12 × 12?`, answer: '144', hint: 'Piensa en la tabla del 12' },
+      { clue: 'La segunda cerradura requiere conocimiento de fracciones.', question: '¿Cuánto es 1/2 + 1/4?', answer: '3/4', hint: 'Necesitas encontrar un denominador común' },
+      { clue: 'La última cerradura es de geometría.', question: '¿Cuántos lados tiene un hexágono?', answer: '6', hint: 'Hexa significa seis en griego' },
+    ]
+  };
+}
+
+// ══════════════════════════════════════════════════════════
+//  GAME: MATH CHALLENGE
+// ══════════════════════════════════════════════════════════
+
+function startMathChallenge(day) {
+  const questions = generateMathQuestions(day.topic);
+  gameState = { questions, current: 0, correct: 0 };
+  showMathQuestion();
+}
+
+function generateMathQuestions(topic) {
+  const banks = [
+    // Multiplicación
+    { q: `${r(2,12)} × ${r(2,12)}`, fn: (a,b) => a*b },
+    // División
+    { q: `${r(2,9)*r(2,9)} ÷ ${r(2,9)}`, fn: (a,b) => { const d=b, n=a*b; return { q:`${n} ÷ ${d}`, a:a }; }, special: true },
+    // Fracciones
+    { q: `¿Cuánto es 3/4 de ${r(2,12)*4}?`, fn: n => n*3/4, static: true },
+    // Área
+    { q: `Área de rectángulo ${r(2,12)} × ${r(2,12)} m²`, fn: (a,b) => a*b },
+    // Porcentaje
+    { q: `¿50% de ${r(2,20)*2} es...?`, fn: n => n/2, static: true },
+  ];
+
+  const qs = [];
+  for (let i = 0; i < 5; i++) {
+    const a = r(2,12), b = r(2,12);
+    switch(i % 5) {
+      case 0: { const x=r(2,12), y=r(2,12); qs.push({ q:`${x} × ${y} = ?`, a:`${x*y}` }); break; }
+      case 1: { const d=r(2,9), m=d*r(2,9); qs.push({ q:`${m} ÷ ${d} = ?`, a:`${m/d}` }); break; }
+      case 2: { const n=r(2,12)*4; qs.push({ q:`¿Cuánto es 3/4 de ${n}?`, a:`${n*3/4}` }); break; }
+      case 3: { const x2=r(2,12), y2=r(2,12); qs.push({ q:`Área: ${x2} m × ${y2} m = ?`, a:`${x2*y2}` }); break; }
+      case 4: { const n2=r(2,20)*2; qs.push({ q:`50% de ${n2} = ?`, a:`${n2/2}` }); break; }
+    }
+  }
+  return qs;
+}
+
+function r(min,max) { return Math.floor(Math.random()*(max-min+1))+min; }
+
+function showMathQuestion() {
+  const q = gameState.questions[gameState.current];
+  const total = gameState.questions.length;
+  $('game-area').innerHTML = `
+    <div class="game-progress-row">
+      <span class="game-step">PREGUNTA ${gameState.current+1} / ${total}</span>
+      <span class="game-score">✓ ${gameState.correct} correctas</span>
+    </div>
+    <div class="game-question">🔢 ${q.q}</div>
+    <div class="game-input-row">
+      <input type="text" inputmode="numeric" class="neon-input" id="math-answer" placeholder="Tu respuesta..." autocomplete="off"/>
+      <button class="neon-btn btn-cyan" style="width:auto;padding:12px 20px" onclick="checkMathAnswer()">✓</button>
+    </div>
+    <div class="game-feedback" id="math-feedback"></div>`;
+  $('math-answer').focus();
+  $('math-answer').addEventListener('keydown', e => { if(e.key==='Enter') checkMathAnswer(); });
+}
+
+function checkMathAnswer() {
+  const q = gameState.questions[gameState.current];
+  const ans = $('math-answer').value.trim();
+  const fb  = $('math-feedback');
+  if (!ans) return;
+
+  if (ans === q.a || parseFloat(ans) === parseFloat(q.a)) {
+    gameState.correct++;
+    fb.textContent = '⚡ ¡CORRECTO!';
+    fb.className = 'game-feedback feedback-correct';
+    setTimeout(() => {
+      gameState.current++;
+      if (gameState.current < gameState.questions.length) showMathQuestion();
+      else {
+        const pct = gameState.correct / gameState.questions.length;
+        const xp = Math.round(pct * 100);
+        const perfect = pct === 1;
+        showComplete(xp, `Respondiste ${gameState.correct} de ${gameState.questions.length} correctamente.`, perfect);
+      }
+    }, 900);
+  } else {
+    fb.textContent = `✗ Incorrecto. La respuesta era ${q.a}`;
+    fb.className = 'game-feedback feedback-wrong';
+    setTimeout(() => {
+      gameState.current++;
+      if (gameState.current < gameState.questions.length) showMathQuestion();
+      else showComplete(Math.round((gameState.correct/gameState.questions.length)*100), `${gameState.correct}/${gameState.questions.length} correctas.`);
+    }, 1800);
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  GAME: WORDS BATTLE
+// ══════════════════════════════════════════════════════════
+
+const WORD_CHALLENGES = [
+  { q: 'Elige la oración con el SUJETO subrayado correctamente:', options: ['__El perro__ corre rápido.','El perro __corre__ rápido.','El perro corre __rápido__.','El perro corre rápido __muy__.'], correct: 0, feedback: 'El sujeto es "El perro" — quien realiza la acción.' },
+  { q: 'Selecciona la palabra que está correctamente acentuada:', options: ['cancion','còrazón','corazón','corazon'], correct: 2, feedback: '"Corazón" lleva tilde porque es aguda terminada en N.' },
+  { q: '¿Cuál es el VERBO en la oración "María estudia mucho para sus exámenes"?', options: ['María','estudia','mucho','exámenes'], correct: 1, feedback: '"Estudia" es el verbo — la acción que realiza María.' },
+  { q: 'Encuentra el ERROR en: "Ayer fuimos al parque y juega con nuestros amigos."', options: ['fuimos','parque','juega','amigos'], correct: 2, feedback: 'Debería ser "jugamos" para concordar en tiempo pasado.' },
+  { q: '¿Cuál es el sinónimo de "veloz"?', options: ['lento','rápido','fuerte','grande'], correct: 1, feedback: '"Rápido" y "veloz" significan lo mismo.' },
+  { q: 'Selecciona la forma correcta:', options: ['Había una vez...','Habían una vez...','Avía una vez...','Habia una vez...'], correct: 0, feedback: '"Había" es la forma correcta del verbo haber en imperfecto.' },
+  { q: '¿Cuál palabra es un ADJETIVO?', options: ['correr','rápidamente','hermoso','cantar'], correct: 2, feedback: '"Hermoso" describe cómo es algo — eso lo hace adjetivo.' },
+];
+
+function startWordsBattle(day) {
+  const questions = [...WORD_CHALLENGES].sort(() => Math.random() - 0.5).slice(0, 5);
+  gameState = { questions, current: 0, correct: 0 };
+  showWordsQuestion();
+}
+
+function showWordsQuestion() {
+  const q = gameState.questions[gameState.current];
+  $('game-area').innerHTML = `
+    <div class="game-progress-row">
+      <span class="game-step">RONDA ${gameState.current+1} / ${gameState.questions.length}</span>
+      <span class="game-score">⚔️ ${gameState.correct} puntos</span>
+    </div>
+    <div class="game-question">${q.q}</div>
+    <div class="game-options">
+      ${q.options.map((o,i) => `<button class="opt-btn" id="opt-${i}" onclick="checkWordAnswer(${i})">${o}</button>`).join('')}
+    </div>
+    <div class="game-feedback" id="words-feedback"></div>`;
+}
+
+function checkWordAnswer(idx) {
+  const q = gameState.questions[gameState.current];
+  document.querySelectorAll('.opt-btn').forEach(b => b.disabled = true);
+  const fb = $('words-feedback');
+
+  if (idx === q.correct) {
+    gameState.correct++;
+    $(`opt-${idx}`).classList.add('correct');
+    fb.textContent = `✓ ${q.feedback}`;
+    fb.className = 'game-feedback feedback-correct';
+  } else {
+    $(`opt-${idx}`).classList.add('wrong');
+    $(`opt-${q.correct}`).classList.add('correct');
+    fb.textContent = `✗ ${q.feedback}`;
+    fb.className = 'game-feedback feedback-wrong';
+  }
+
+  setTimeout(() => {
+    gameState.current++;
+    if (gameState.current < gameState.questions.length) showWordsQuestion();
+    else {
+      const pct = gameState.correct / gameState.questions.length;
+      showComplete(Math.round(pct*100), `${gameState.correct}/${gameState.questions.length} respuestas correctas en la batalla.`, pct===1);
+    }
+  }, 2000);
+}
+
+// ══════════════════════════════════════════════════════════
+//  GAME: LOGIC PUZZLES
+// ══════════════════════════════════════════════════════════
+
+const LOGIC_PUZZLES = [
+  { q:'Si tienes 3 cajas y en cada caja hay 4 pelotas, ¿cuántas pelotas hay en total?', options:['7','12','10','14'], correct:1 },
+  { q:'Un tren sale a las 8:30 AM y llega 2 horas y 45 minutos después. ¿A qué hora llega?', options:['10:45 AM','11:15 AM','11:00 AM','10:30 AM'], correct:1 },
+  { q:'Si el patrón es: 2, 4, 8, 16... ¿cuál es el siguiente número?', options:['18','20','32','24'], correct:2 },
+  { q:'Ana tiene el doble de dinero que Beto. Si Beto tiene $15, ¿cuánto tiene Ana?', options:['$25','$30','$17','$20'], correct:1 },
+  { q:'¿Cuántos triángulos hay en una figura con 4 triángulos grandes que cada uno tiene 2 pequeños adentro?', options:['4','8','12','6'], correct:2 },
+  { q:'Un libro tiene 120 páginas. Leíste 3/4 del libro. ¿Cuántas páginas te faltan?', options:['30','40','90','45'], correct:0 },
+];
+
+function startLogicPuzzle(day) {
+  const qs = [...LOGIC_PUZZLES].sort(()=>Math.random()-0.5).slice(0,4);
+  gameState = { questions:qs, current:0, correct:0 };
+  showLogicQuestion();
+}
+
+function showLogicQuestion() {
+  const q = gameState.questions[gameState.current];
+  $('game-area').innerHTML = `
+    <div class="game-progress-row">
+      <span class="game-step">ACERTIJO ${gameState.current+1} / ${gameState.questions.length}</span>
+      <span class="game-score">🧩 ${gameState.correct} resueltos</span>
+    </div>
+    <div class="game-question">🧩 ${q.q}</div>
+    <div class="game-options">
+      ${q.options.map((o,i) => `<button class="opt-btn" id="lopt-${i}" onclick="checkLogicAnswer(${i})">${o}</button>`).join('')}
+    </div>
+    <div class="game-feedback" id="logic-feedback"></div>`;
+}
+
+function checkLogicAnswer(idx) {
+  const q = gameState.questions[gameState.current];
+  document.querySelectorAll('.opt-btn').forEach(b => b.disabled = true);
+  if (idx === q.correct) { gameState.correct++; $(`lopt-${idx}`).classList.add('correct'); }
+  else { $(`lopt-${idx}`).classList.add('wrong'); $(`lopt-${q.correct}`).classList.add('correct'); }
+  setTimeout(() => {
+    gameState.current++;
+    if (gameState.current < gameState.questions.length) showLogicQuestion();
+    else showComplete(Math.round((gameState.correct/gameState.questions.length)*100), `${gameState.correct}/${gameState.questions.length} acertijos resueltos.`, gameState.correct===gameState.questions.length);
+  }, 1800);
+}
+
+// ══════════════════════════════════════════════════════════
+//  GAME: TREASURE MAP (chained clues)
+// ══════════════════════════════════════════════════════════
+
+const TREASURE_CLUES = [
+  { clue:'🗺️ Pista 1: Para encontrar la siguiente coordenada, resuelve: Si una caja tiene 24 galletas y las divides en 6 grupos iguales...', q:'¿Cuántas galletas hay en cada grupo?', a:'4' },
+  { clue:'🗺️ Pista 2: ¡Bien! La siguiente clave es una palabra. Completa: "El ___ sale por el este y se pone por el oeste."', q:'¿Cuál es la palabra que falta?', a:'sol' },
+  { clue:'🗺️ Pista 3: Casi llegas. Multiplica el número de lados de un triángulo por el número de lados de un cuadrado...', q:'¿Cuál es el resultado?', a:'12' },
+  { clue:'🗺️ Pista 4: ¡Última pista! Un rectángulo tiene largo 8 m y ancho 5 m.', q:'¿Cuál es su perímetro en metros?', a:'26' },
+  { clue:'🗺️ Pista 5: ¡El tesoro está cerca! Escribe el plural de "café"', q:'¿Cuál es el plural de "café"?', a:'cafés' },
+];
+
+function startTreasureMap(day) {
+  const clues = [...TREASURE_CLUES].sort(()=>Math.random()-0.5).slice(0,4);
+  gameState = { clues, current:0, errors:0 };
+  showTreasureClue();
+}
+
+function showTreasureClue() {
+  const c = gameState.clues[gameState.current];
+  const total = gameState.clues.length;
+  $('game-area').innerHTML = `
+    <div class="game-progress-row">
+      <span class="game-step">PISTA ${gameState.current+1} DE ${total}</span>
+      <span class="game-score">🗺️ ${total-gameState.current-1} pasos al tesoro</span>
+    </div>
+    <div class="escape-clue">${c.clue}</div>
+    <div class="game-question">${c.q}</div>
+    <div class="game-input-row">
+      <input type="text" class="neon-input" id="treasure-answer" placeholder="Tu respuesta..." autocomplete="off"/>
+      <button class="neon-btn btn-cyan" style="width:auto;padding:12px 20px" onclick="checkTreasureAnswer()">→</button>
+    </div>
+    <div class="game-feedback" id="treasure-feedback"></div>`;
+  $('treasure-answer').focus();
+  $('treasure-answer').addEventListener('keydown', e => { if(e.key==='Enter') checkTreasureAnswer(); });
+}
+
+function checkTreasureAnswer() {
+  const c = gameState.clues[gameState.current];
+  const ans = $('treasure-answer').value.trim().toLowerCase();
+  const fb = $('treasure-feedback');
+  if (!ans) return;
+
+  if (ans === c.a || ans.includes(c.a) || c.a.includes(ans)) {
+    fb.textContent = '✓ ¡Pista encontrada! Siguiente coordenada desbloqueada...';
+    fb.className = 'game-feedback feedback-correct';
+    setTimeout(() => {
+      gameState.current++;
+      if (gameState.current < gameState.clues.length) showTreasureClue();
+      else {
+        const xp = gameState.errors === 0 ? 120 : 80;
+        showComplete(xp, '¡Encontraste el tesoro escondido! Eres un explorador excepcional.', gameState.errors===0);
+      }
+    }, 1200);
+  } else {
+    gameState.errors++;
+    fb.textContent = '✗ Respuesta incorrecta. Intenta de nuevo.';
+    fb.className = 'game-feedback feedback-wrong';
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  GAME: LIGHTNING (speed questions)
+// ══════════════════════════════════════════════════════════
+
+function startLightning(day) {
+  const qs = generateMathQuestions(day.topic).concat(generateMathQuestions(day.topic)).slice(0,8);
+  gameState = { questions:qs, current:0, correct:0, timeLeft:60 };
+  showLightningQuestion();
+  startTimer();
+}
+
+function startTimer() {
+  clearInterval(gameState.timerInterval);
+  gameState.timerInterval = setInterval(() => {
+    gameState.timeLeft--;
+    const el = $('lightning-timer');
+    if (el) { el.textContent = `⚡ ${gameState.timeLeft}s`; el.style.color = gameState.timeLeft <= 10 ? 'var(--red)' : 'var(--amber)'; }
+    if (gameState.timeLeft <= 0) {
+      clearInterval(gameState.timerInterval);
+      const pct = gameState.correct / gameState.questions.length;
+      showComplete(Math.round(pct*80), `Respondiste ${gameState.correct} preguntas en 60 segundos. ¡Velocidad máxima!`, pct===1);
+    }
+  }, 1000);
+}
+
+function showLightningQuestion() {
+  if (gameState.current >= gameState.questions.length) {
+    clearInterval(gameState.timerInterval);
+    showComplete(Math.round((gameState.correct/gameState.questions.length)*80), `¡Completaste todas las preguntas! ${gameState.correct}/${gameState.questions.length} correctas.`, gameState.correct===gameState.questions.length);
+    return;
+  }
+  const q = gameState.questions[gameState.current];
+  $('game-area').innerHTML = `
+    <div class="game-progress-row">
+      <span class="game-step">PREGUNTA ${gameState.current+1}</span>
+      <span id="lightning-timer" class="game-score">⚡ ${gameState.timeLeft}s</span>
+    </div>
+    <div class="game-question">⚡ ${q.q}</div>
+    <div class="game-input-row">
+      <input type="text" inputmode="numeric" class="neon-input" id="lightning-answer" placeholder="Rápido!" autocomplete="off"/>
+      <button class="neon-btn btn-cyan" style="width:auto;padding:12px 20px" onclick="checkLightningAnswer()">⚡</button>
+    </div>
+    <div class="game-feedback" id="lightning-feedback"></div>`;
+  $('lightning-answer').focus();
+  $('lightning-answer').addEventListener('keydown', e => { if(e.key==='Enter') checkLightningAnswer(); });
+}
+
+function checkLightningAnswer() {
+  const q = gameState.questions[gameState.current];
+  const ans = $('lightning-answer').value.trim();
+  const fb = $('lightning-feedback');
+  if (!ans) return;
+
+  if (ans === q.a || parseFloat(ans) === parseFloat(q.a)) {
+    gameState.correct++;
+    fb.textContent = '⚡ ¡CORRECTO!';
+    fb.className = 'game-feedback feedback-correct';
+  } else {
+    fb.textContent = `✗ Era ${q.a}`;
+    fb.className = 'game-feedback feedback-wrong';
+  }
+  setTimeout(() => { gameState.current++; showLightningQuestion(); }, 600);
+}
+
+// ══════════════════════════════════════════════════════════
+//  UTILS
+// ══════════════════════════════════════════════════════════
+
+function closeModal(id) { $(id).classList.add('hidden'); }
+
+// Close modals clicking outside
+document.addEventListener('click', e => {
+  document.querySelectorAll('.modal:not(.hidden)').forEach(m => {
+    if (e.target === m) closeModal(m.id);
+  });
+});
+
+// Keyboard ESC closes modals
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.querySelectorAll('.modal:not(.hidden)').forEach(m => closeModal(m.id));
+  }
+});
